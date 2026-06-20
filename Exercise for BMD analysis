@@ -1,0 +1,1880 @@
+---
+title: 'Exercise for BMD analysis'
+output: html_document
+date: "2025-02"
+
+For a better understanding of the dataset, we will going to explain the data extracted from the original studies included in this systematic review.
+- studyID indicates the name of the study. Each row corresponds to each study-arm.
+- n refers to the total sample size of the the specific study-arm.
+- age_mean represents the average age of the adults included in the specific study-arm.
+- country  indicates the region/continent where the study was carried out.
+- pc_female refers to the percentage of females within the specific study-arm.
+- bmi_score indicates the average Body Mass Index of the sample at baseline.  
+- comorbid refers to the presence of orthopedic-related co-morbidities within the study sample.
+- vitD_suppl refers to the supplementation of Vitamin D .
+These variables were characteristics that help us to qualitatively describe the sample of our included studies. The following variables correspond with descriptive statistics.
+- trt is the type of physical activity performed in a specific study-arm.
+- mean_diff is the mean change in BMD from baseline for a specific study-arm.
+- mean_diff_sd is the standard deviation of the mean change from baseline.
+- sessionsrefers to the frequency of intervention in terms of sessions per week.
+- session_duration is the average session time of minutes per day.
+- daily_dose corresponds to the METs-min/day (i.e., daily dose of physical activity) of each study-arm.
+- weekly_dose corresponds to the daily dose multiplied by the intervention frequency, yielding the weekly dose of physical activity (i.e., METs-min/week).
+- response corresponds to the number of fractures in a specific study-arm.
+
+---
+
+### Load Libraries
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide'}
+
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(tidybayes)
+library(brms)
+library(readxl)
+library(ggthemes)
+library(ggtext)
+library(ggsci)
+library(cowplot)
+library(MBNMAdose)
+library(kableExtra)
+library(ggdist)
+library(patchwork)
+library(ggmcmc)
+library(ggridges)
+library(modelr)
+library(marginaleffects)
+library(metafor)
+library(netmeta)
+library(gt)
+library(extrafont)
+library(janitor)
+
+# setting theme
+plot_theme <- ggthemes::theme_fivethirtyeight() %+replace%
+    ggplot2::theme(legend.position = "none",
+          text = ggplot2::element_text(family = "sans"),
+          axis.title.x = ggplot2::element_text(hjust = 1, vjust = 0.5, margin = margin(t = 5, b = 5, r = 5, l = 5)),
+          axis.title.y = ggplot2::element_text(vjust = 1, angle = 90, hjust = 0.5, margin = margin(t = 5, b = 5, r = 5, l = 5)),
+          panel.background = ggplot2::element_blank(),
+          plot.background = ggplot2::element_blank(),
+          strip.background = ggplot2::element_blank(),
+          legend.background = ggplot2::element_blank())
+
+```
+
+
+#### Load our dataset
+
+```{r, echo=FALSE}
+
+d <- read_csv("bmd data.csv") %>%
+  mutate(across(c(n, mean_diff_sd, mean_diff, length, pre_mean, pre_sd, bmi_score), as.numeric),
+         md_se = ifelse(is.na(mean_diff_sd) | is.na(n), NA, mean_diff_sd/sqrt(n)))
+
+# Load our dataset from bayesian analyses, Read the analyses that we don't want to re-run
+
+# model_by_treatment <- readRDS("model_by_treatment.RDS")
+# model_by_dose <- readRDS("model_by_dose.RDS")
+# model_by_length <- readRDS("model_by_length.RDS")
+
+# moderate_by_nothing <- readRDS("moderate_by_nothing.RDS")
+# moderate_by_gender <- readRDS("moderate_by_gender.RDS")
+# moderate_by_age <- readRDS("moderate_by_age.RDS")
+# moderate_by_comorbidities <- readRDS("moderate_by_comorbidities.RDS")
+# moderate_by_bmd <- readRDS("moderate_by_bmd.RDS")
+# moderate_by_bmi <- readRDS("moderate_by_bmi.RDS")
+# moderate_by_vitDsuppl <- readRDS("moderate_by_vitDsuppl.RDS")
+
+# one_rob_at_a_time <- readRDS("models_one_rob_at_a_time.RDS")
+
+```
+
+
+#### Load custom functions
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
+
+gci <- function(est_data, treatment){
+  est_data %>%
+    filter(trt == treatment) %>%
+    mutate(summary = paste(
+      "(*n* = ", format(n, big.mark = ","),
+      ", *k* = ", k,
+      ", *g* = ", ## also add n and k
+      format(round(estimate,2), nsmall = 2),
+      " [", format(round(min(c(conf.low, conf.high)),2), nsmall = 2),
+      ", ", format(round(max(c(conf.low, conf.high)),2), nsmall = 2),"])",
+      sep = ""
+    )) %>% select(summary) %>%
+    as.character() %>% return()
+}
+
+getmode <- function(v) {
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+indirectness_scores <- function(dat){
+  dat$indirect <- 1 + as.numeric(dat$comorbid=="Reported")
+  indirect <- dat %>% group_by(studyID) %>%
+    summarise(indirect = max(indirect))
+  dat <- dat %>% select(-indirect) %>% 
+    left_join(., indirect)
+  dat$indirect
+}
+
+d$indirectness <- indirectness_scores(d)
+
+aggregate_effects <- function(dat, n=99){
+  dat <- mutate(dat,
+                arm_id = paste0(studyID, trt),
+                md_se = mean_diff_sd/sqrt(n))
+  dat <- escalc(data = dat,
+                yi = mean_diff,
+                sei = md_se) %>%
+    aggregate(cluster = arm_id,
+              rho = .6)
+  dat$overall <- fct_relevel(dat$overall,
+                             "High",
+                             after = 2)
+  as.data.frame(dat)
+}
+
+create_pairwise_data <- function(dat){
+  dat <- aggregate_effects(dat, n)
+  dat <- pairwise(treat = trt,
+                  TE = yi,
+                  seTE = sqrt(vi),
+                  reference.group = "Control",
+                  studlab = studyID,
+                  data = dat,
+                  #n = n,
+                  sm = "md")
+  dat
+}
+
+priors <- c(prior(normal(0,1), class = Intercept),
+            prior(cauchy(0,1), class = sd))
+
+
+apa <- function(x, title = " ") {
+  gt(x) %>%
+  tab_options(
+    table.border.top.color = "white",
+    heading.title.font.size = px(16),
+    column_labels.border.top.width = 3,
+    column_labels.border.top.color = "black",
+    column_labels.border.bottom.width = 3,
+    column_labels.border.bottom.color = "black",
+    table_body.border.bottom.color = "black",
+    table.border.bottom.color = "white",
+    table.width = pct(100),
+    table.background.color = "white"
+  ) %>%
+  cols_align(align="center") %>%
+  tab_style(
+    style = list(
+      cell_borders(
+        sides = c("top", "bottom"),
+        color = "white",
+        weight = px(1)
+      ),
+      cell_text(
+        align="center"
+      ),
+      cell_fill(color = "white", alpha = NULL)
+      ),
+    locations = cells_body(
+      columns = everything(),
+      rows = everything()
+    )
+  ) %>%
+    #title setup
+    tab_header(
+    title = html("<i>", title, "</i>")
+  ) %>%
+  opt_align_table_header(align = "left")
+}
+
+```
+
+
+### Chapter 1: Studies Characteristics
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
+
+cis_table <- d %>%
+  select(studyID_ROB, country, trt,
+         pc_female, n, age_mean, bmi_score, 
+         length, weekly_dose,
+         comorbid, vitD_suppl, outcome) %>%
+  arrange(tolower(studyID_ROB), length, pc_female, desc(trt)) %>%
+  group_by(studyID_ROB, trt) %>% 
+  mutate(n = max(n, na.rm = T),
+         pc_female = as.integer(round(as.numeric(str_remove_all(pc_female, "%")), 0)),
+         length = round(length, 0),
+         weekly_dose = ifelse(is.na(weekly_dose), NA, round(weekly_dose, 0)),
+         comorbid = ifelse(comorbid == "Reported", "Y", "N"),
+         vitD_suppl = ifelse(vitD_suppl == "Reported","Y","N"),
+         outcome = paste0(unique(outcome), collapse = ", "),
+         length = paste0(unique(length), collapse = ", ")) %>%
+  distinct() %>% 
+  group_by(studyID_ROB) %>%
+  rename("Author, Year" = studyID_ROB,
+         Country = country,
+         "Gender (%)" = pc_female,
+         "N" = n,
+         "Age (Mean)" = age_mean,
+         "Orthopedic related comorbidities" = comorbid,
+         "Vitamin D supplement" = vitD_suppl,
+         "BMI (kg/㎡)" = bmi_score,
+         "Exercise type" = trt,
+         "Length (weeks)" = length,
+         "Exercise dose (METs-min/week)" = weekly_dose,
+         "Outcomes measured" = outcome)
+cis_table %>%
+  apa("Supplement 4. Characteristics of Included Studies") %>%
+  gtsave("Characteristics of Included Studies Table.html")
+
+cis_table %>%
+  apa("Characteristics of Included Studies Table.docx")
+
+cis_table %>%
+  apa() %>%
+  gtsave(filename = "Characteristics of Included Studies Table.docx")
+
+cis_table %>%
+  ungroup() %>%
+  apa("Supplement 4. Characteristics of Included Studies") %>%
+  tab_options(
+    ihtml.active = TRUE,
+    ihtml.use_filters = TRUE,
+    ihtml.use_compact_mode = FALSE,
+    ihtml.use_pagination = FALSE
+  ) %>% gtsave("Characteristics of Included Studies Interactive.html")
+
+```
+
+
+### Chapter 2: Studies Risk of Bias
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
+
+rob_judgments <- select(d, studyID_ROB, D1:D5, overall) %>%
+  group_by(studyID_ROB) %>%
+  summarise_all(list(mode = getmode))
+names(rob_judgments) <- gsub("_mode", "", names(rob_judgments))
+
+rob_table <- rob_judgments %>%
+  arrange(tolower(studyID_ROB)) %>%
+  distinct() %>% 
+  mutate(across(D1:overall,
+                gsub,
+                pattern = " risk",
+                replacement = "")) %>%
+  select(studyID_ROB,
+         D1,
+         D2,
+         D3,
+         D4,
+         D5,
+         overall) %>%
+  rename("Author, Year" = studyID_ROB,
+         "Randomization process" = D1,
+         "Missing outcome data " = D2,
+         "Measurement of the outcome" = D3,
+         "Selection of the reported result " = D4,
+         "Incomplete outcome" = D5,
+         "Overall bias" = overall) %>%
+  apa("Supplement 5. Risk of Bias in Individual Studies")
+rob_table %>% gtsave("Risk of Bias in Individual Studies.html")
+rob_table %>% gtsave("Risk of Bias in Individual Studies.docx")
+
+```
+
+
+# Chapter 3: Exercise for Lumbar/Femoral/Hip BMD Analysis
+
+Guided by Harrer (2021), we are going to fit a Bayesian meta-analysis model using the formula `response | se(se_response) ~ 1 + predictors + (1 | grouping variable)`, where our response variable is the mean difference in BMD, predicted by the weekly energy expenditure (METs-min/week), the length of intervention, and the population characteristics, and maintaining the clusterisation of the effect sizes within studies (`studyID` as grouping variable).
+
+### Creating Pairwise Data and CINeMA Data
+
+First, we are going to filter our data by the outcome of interest (i.e., `Lumbar BMD`).
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
+
+d_bmd <- d %>% 
+  filter(outcome == "Lumbar BMD") %>%
+#  filter(outcome == "Femoral BMD") %>%
+#  filter(outcome == "Hip total BMD") %>%
+  mutate(length = as.numeric(length)) %>% 
+  group_by(studyID) %>% 
+  filter(length == max(length, na.rm = TRUE)) %>% 
+  ungroup()
+
+d_bmd_pooled <- d_bmd %>%
+  group_by(studyID) %>%
+  filter(n_distinct(trt) > 1) %>%
+  ungroup() %>%
+  group_by(studyID, trt) %>%
+  summarise(
+    mean_diff_pooled = sum(n * mean_diff) / sum(n),
+    md_se = sqrt(sum((n - 1) * md_se^2 + n * (mean_diff - mean_diff_pooled)^2) / (sum(n) - 1)),
+    n = sum(n),
+    mean_diff_sd = md_se * sqrt(n),
+    overall = first(overall),
+    indirectness = first(indirectness),
+    .groups = 'drop'
+  )%>%
+  rename(mean_diff = mean_diff_pooled)
+
+if(!exists("model_by_treatment")){
+  model_by_treatment <- brm(mean_diff | se(md_se) ~ 1 + trt + (1 | studyID),
+                                   data = d_bmd,
+                                   control = list(adapt_delta = 0.99),
+                                   cores = 8, chains = 8,
+                                   prior = priors, silent = 2)
+  saveRDS(model_by_treatment, "model_by_treatment.RDS")
+}
+
+conditional_effects <- conditional_effects(model_by_treatment)
+active_control_est <- conditional_effects(model_by_treatment)$trt$estimate__[3]
+
+#MCID value
+mcid <- d %>%
+  mutate(length = as.numeric(length)) %>% 
+  group_by(studyID) %>% 
+  filter(length == max(length, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  filter(outcome %in% c("Femoral BMD", "Lumbar BMD", "Hip total BMD")) %>%
+  mutate(
+    pre_n = as.numeric(pre_n),
+    pre_mean = as.numeric(pre_mean),
+    pre_sd = as.numeric(pre_sd)
+  ) %>%
+  filter(!is.na(pre_n) & !is.na(pre_mean)) %>%
+  group_by(outcome) %>%
+  summarise(
+    Total_Arms = n(),
+    Total_Baseline_N = sum(pre_n),
+    # BMD: sum(n * pre_mean) / sum(n)
+    Pooled_Baseline_Mean = sum(pre_n * pre_mean, na.rm = TRUE) / sum(pre_n, na.rm = TRUE),
+    # MCID = 1 or 2% of baseline BMD
+    MCID_1pct = 0.01 * Pooled_Baseline_Mean,
+    MCID_2pct = 0.02 * Pooled_Baseline_Mean
+  ) %>%
+  mutate(
+    across(where(is.numeric), ~ round(.x, 4))
+  )
+
+one_effect_per_arm <- aggregate_effects(d_bmd_pooled)
+
+one_effect_per_arm %>%
+  mutate(rob = as.numeric(factor(overall, levels = c("Low", "Some concern", "High")))) %>%
+  select(studyID, trt, mean_diff, mean_diff_sd, n, rob, indirectness) %>%
+  write.csv(.,
+          "one_effect_per_arm.csv")
+
+
+# Forest plot of pairwise
+full_pairwise_data <- create_pairwise_data(d_bmd)
+
+full_pairwise_model <- netmeta(full_pairwise_data,
+                               common = FALSE,
+                               reference.group = "Control")
+
+pdf(file = "forest plot of pairwise.pdf")
+plot(full_pairwise_model,
+     sortvar = names(sort(netrank(full_pairwise_model)[[1]])),
+     reference.group = "Control", digits=3)
+dev.off()
+
+# Set stretching to control instead of exercise
+ex_control_pairwise <- filter(full_pairwise_data, treat1 == "Control" | treat2 == "Control")
+ex_control_pairwise$higher_favours_intervention <- ex_control_pairwise$treat1 == "Control"
+ex_control_pairwise$TE <- ifelse(ex_control_pairwise$higher_favours_intervention,
+                                 ex_control_pairwise$TE * -1,
+                                 ex_control_pairwise$TE)
+
+# Network plot
+n_per_trt <- d_bmd %>% group_by(trt) %>%
+  summarise(n = sum(n))
+
+pts_size <- table(c(full_pairwise_model$treat1, full_pairwise_model$treat2))
+pts_size <- as.data.frame(pts_size) %>% rename(trt = Var1)
+pts_size <- left_join(pts_size, n_per_trt)
+
+
+pdf(file = "Figure 2. Network_plot.pdf", width = 9, height = 6)
+netmeta::netgraph(full_pairwise_model,
+                  points = TRUE,
+                  cex.points = pts_size$n,
+                  plastic = FALSE,
+                  lwd = 2,
+                  offset = .04,
+                  col = "darkgrey",
+                  col.points = "#00B2BE",
+                  number.of.studies = TRUE,
+                  labels = paste0(trts, " (n=", n.trts, ")"),
+                  alpha.transparency = .3)
+dev.off()
+
+```
+
+
+### Publication Bias
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
+# for publication bias plots compare studies with typical exercise vs typical control groups
+
+# need publication bias estimate for all arms compared with control
+
+pub_results <- d_bmd %>%
+  group_by(trt) %>%
+  summarise(arms = unique(trt)) %>%
+  filter(arms != "Control")
+
+pub_results$s_value <- as.character(NA)
+pub_results$eggers_p_value <- as.numeric(NA)
+
+
+for(i in 1:dim(pub_results)[1]){
+  #i <- 1
+  pub_bias_data <- full_pairwise_data %>% filter((trt1 == "Control" |
+                                                    trt2 == "Control") & 
+                                                   (trt1 == pub_results$trt[i] |
+                                                      trt2 == pub_results$trt[i]))
+  if(dim(pub_bias_data)[1] >= 10) {
+    
+    
+    # The pairwise function to make contrast-based dataframes can't handle
+    # multiple outcomes for the same arm, or multiple uses of the same treatment
+    # so calculate pooled ES for each arm
+    
+    #pub_bias_data$higher_favours_intervention <- pub_bias_data$treat1 == "Control"
+    #pub_bias_data$TE <- ifelse(pub_bias_data$higher_favours_intervention, pub_bias_data$TE * -1, pub_bias_data$TE)
+    
+    s_value <- PublicationBias::pubbias_svalue(yi = pub_bias_data$TE,
+                                               vi = pub_bias_data$seTE^2,
+                                               cluster = pub_bias_data$studyID,
+                                               model_type = "robust",
+                                               favor_positive = FALSE)
+    summary(s_value)
+    pub_results$s_value[i] <- summary(s_value)[[1]]
+    
+    eggers <- rma.mv(yi = TE,
+                     V = seTE^2,
+                     mods = ~ seTE,
+                     random = ~ 1 | studyID,
+                     data = pub_bias_data, test = "t")
+    
+    pub_results$eggers_p_value[i] <- eggers$QMp
+    #summary(peese)
+  }
+  
+}
+
+pub_results$decision <- 1 + ifelse(is.na(pub_results$s_value),
+                                   1,
+                                   as.numeric(pub_results$s_value != "Not possible") + 
+                                     as.numeric(pub_results$eggers_p_value < 0.05))
+
+write.csv(pub_results, 
+         "pub_bias_vs_active_controls.csv")
+
+
+funnel_plot <- PublicationBias::significance_funnel(yi = ex_control_pairwise$TE,
+                                          sei = ex_control_pairwise$seTE,
+                                          favor_positive = FALSE)
+funnel_plot
+
+ggsave("funnel_plot.pdf", plot = funnel_plot, width = 8, height = 6)
+
+```
+
+
+### Risk of Bias Sensitivity Analyses
+
+#### Sensitivity analyses for risk of bias criteria
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
+
+rob_criteria <- names(select(d_bmd, D1:D3, D5)) #D4 are all low risk
+merge_unclear_high <- function(rob_col){
+  rob_col <- factor(rob_col)
+  levels(rob_col) <- c("Low",
+                       "Some concern or high",
+                       "Some concern or high")
+  rob_col
+}
+
+rob_data <- ex_control_pairwise
+rob_data[, rob_criteria] <- lapply(rob_data[, rob_criteria], merge_unclear_high)
+if(!exists("one_rob_at_a_time")){
+  one_rob_at_a_time <- data.frame(estimate = NA,
+                                  l95ci = NA,
+                                  u95ci = NA)
+  for(i in 1:length(rob_criteria)){
+    #i <- 8
+    rob_form <- as.formula(paste0("TE | se(seTE) ~ 1 + (1 | studlab) + ",
+                                  rob_criteria[i]))
+    
+    refm_fit <- brm(rob_form, data = rob_data,
+                    # control = list(adapt_delta = 0.99,
+                    #                max_treedepth = 20),
+                    cores = 8, chains = 8,
+                    prior = priors, silent = 2)
+    get_effs <- clean_names(conditional_effects(refm_fit)[[1]])
+    get_effs[,1] <- names(get_effs)[1]
+    names(get_effs)[1] <- "domain"
+    get_effs <- get_effs %>% select(domain, effect1, estimate, lower, upper)
+    if(i==1){
+      one_rob_at_a_time <- get_effs
+    } else {
+      one_rob_at_a_time <- rbind(one_rob_at_a_time,
+                                 get_effs)
+    }
+    #summary(refm_fit, prob = .90)
+  }
+  saveRDS(one_rob_at_a_time, "models_one_rob_at_a_time.RDS")
+}
+
+sensitivity_plot <- one_rob_at_a_time %>% 
+  ggplot(aes(x = domain,
+              y = estimate,
+              ymin = lower,
+              ymax = upper,
+             colour = effect1)) + 
+  scale_colour_manual(values = c("darkgreen", "red"))+
+  geom_pointrange(position = position_dodge(width = 0.8)) + 
+  geom_richtext(label = "Low risk of bias", colour = "darkgreen", x = 3.8, y = 0.06) + 
+  geom_richtext(label = "Some concern or high risk of bias", colour = "red", x = 4.2, y = 0.07) + 
+  xlab("Risk of bias criteria") +
+  ylab("Between-group difference for exercise vs. control") +
+  coord_flip() + plot_theme
+
+sensitivity_plot
+ggsave("Supplement 17. Sensitivity analyses for risk of bias.pdf", width = 12, height = 6)
+
+```
+
+
+####  Individual and summary studies of risk of bias
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
+
+library(robvis)
+
+rob_figures <- full_pairwise_data %>% select(studyID,
+                         D1,
+                         D2,
+                         D3,
+                         D4,
+                         D5,
+                         overall,
+                         seTE)
+
+names(rob_figures) <- c("Study",
+                     "Randomization process",
+                     "Deviations from intended interventions",
+                     "Missing outcome data",
+                     "Measurement of the outcomer",
+                     "Selection of the reported result ",
+                     "Overall",
+                     "Weight")
+
+rob_summary <- rob_summary(data = rob_figures,
+                           overall = TRUE,
+                           tool = "ROB2")
+
+ggsave("Supplement 16. ROB_summary.pdf",
+       rob_summary,
+       width = 10,
+       height = 4)
+
+```
+
+
+### Forest Plot of Interventions for Each Arm
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
+
+library(tidytext)
+
+treatments_by_k <- d_bmd %>% group_by(trt) %>% summarise(n = n()) %>% arrange(-n)
+
+forest_each_arm <- d_bmd %>%
+  mutate(studyID = factor(studyID, levels = unique(studyID)),
+         ymin = round(mean_diff - 1.96 * mean_diff_sd/sqrt(n),2),
+         ymax = round(mean_diff + 1.96 * mean_diff_sd/sqrt(n),2),
+         md = round(mean_diff,2),
+         trt = factor(trt,
+                      levels = treatments_by_k$trt)) %>%
+  ggplot(aes(x = reorder_within(studyID, mean_diff, trt),
+             y = mean_diff,
+             ymin = ymin,
+             ymax = ymax,
+             colour = mean_diff,
+             alpha = 100-n/max(n),
+             text = trt)) +
+  geom_pointrange() + plot_theme +
+  scale_x_reordered() +
+  xlab("Study") + 
+  ylab("MD ± 95% CI") + 
+  coord_flip(ylim = c(-0.3,0.3)) + 
+  facet_grid(trt ~ ., scales = "free", space = "free") 
+
+ggsave("Supplement 7. Forest plot of each data point informing each arm.pdf",
+       forest_each_arm,
+         width = 10,
+         height = 40)
+
+```
+
+
+### Exploratory Data Analysis
+
+Before embarking on an analysis, the first step is to have a look at the raw data. It is recommended to explore the potential dose-response association between the variables that we'll introduce in our model in order to fit one model function or another. Splines allow a more flexible fitting, showing a more sensible data adjusting.
+
+#### Spline dose-response function considering different age levels
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
+
+pdf("Supplement 8. Visualization of age-response trend.pdf")
+d_bmd %>% filter(trt != "Control") %>%
+  ggplot(aes(x = age_mean, y = mean_diff)) +
+#  facet_grid(cols = vars(trt)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y ~ splines::ns(x, 3)) +
+  labs(y = "Mean change in BMD (g/cm2)",
+       x = "Mean age (year)") +
+  scale_y_continuous(breaks = seq(-0.2, 0.2, 0.04)) +
+  scale_x_continuous(breaks = seq(40, 80, 5))
+dev.off()
+
+```
+
+
+#### Spline dose-response function considering weekly dose in METs
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
+
+pdf("Supplement 8. Visualization of dose-response trend.pdf")
+d_bmd %>% filter(trt != "Control") %>%
+  ggplot(aes(x = weekly_dose, y = mean_diff)) +
+#  facet_grid(cols = vars(trt)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y ~ splines::ns(x, 3)) +
+  labs(y = "Mean change in BMD (g/cm2)",
+       x = "Dose (METs−min/week)") +
+  scale_y_continuous(breaks = seq(-0.2, 0.2, 0.04)) +
+  scale_x_continuous(breaks = seq(0, 2000, 300))
+dev.off()
+
+```
+
+
+#### Spline dose-response function considering length of exercise
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
+
+d_bmd_length <- d %>% 
+  filter(outcome == "Lumbar BMD")
+#  filter(outcome == "Femoral BMD")
+#  filter(outcome == "Hip total BMD")
+  
+pdf("Supplement 8. Visualization of length-response trend.pdf")
+d_bmd_length %>% filter(trt != "Control") %>%
+  ggplot(aes(x = length, y = mean_diff)) +
+#  facet_grid(cols = vars(trt)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y ~ splines::ns(x, 3)) +
+  labs(y = "Mean change in BMD (g/cm2)",
+       x = "Length (weeks)") +
+  scale_y_continuous(breaks = seq(-0.2, 0.2, 0.04)) +
+  scale_x_continuous(breaks = seq(12, 104, 10))
+dev.off()
+
+```
+#### Spline dose-response function considering BMI levels
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
+
+pdf("Supplement 8. Visualization of bmi-response trend.pdf")
+d_bmd %>% filter(trt != "Control") %>% 
+  ggplot(aes(x = bmi_score, y = mean_diff)) +
+#  facet_grid(cols = vars(trt)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y ~ splines::ns(x, 3)) +
+  labs(y = "Mean change in BMD (g/cm2)",
+       x = "BMI (kg/m2)") +
+  scale_y_continuous(breaks = seq(-0.2, 0.2, 0.04)) +
+  scale_x_continuous(breaks = seq(18, 40, 2))
+dev.off()
+
+```
+
+
+### What about the Dose?
+
+#### Fitting a dose-response model for intervention length
+
+```{r, message=FALSE, warning=FALSE, error=FALSE, cache.comments=FALSE}
+
+if(!exists("model_by_length")){
+  model_by_length <- brms::brm(mean_diff | se(md_se) ~ 1 + s(length, k = 4) + (1 | studyID + trt),
+                       data = filter(d_bmd_length,
+                                     trt != "Control"),
+                       control = list(adapt_delta = 0.99),
+                       cores = 8, chains = 8,
+                       iter = 6000,
+                       prior = priors, silent = 2)
+  saveRDS(model_by_length, file = "model_by_length.RDS")
+}
+
+
+# Fitting a prediction model 
+length.data <- model_by_length %>% 
+  epred_draws(newdata = expand_grid(md_se = mean(d_bmd_length$md_se), 
+                                    length = c(26, 52, seq(5, 100, 5)),
+                                    agent = d_bmd_length %>% 
+                                      filter(trt != "Control") %>%
+                                      .$agent %>% unique()),
+              re_formula = ~ (1 | agent))
+
+# Plotting dose-response relationship between exercise dose (METs-min/week) and effect size (MD) 
+length_plot <- ggplot(length.data, aes(x = length, y = .epred - active_control_est)) +
+  stat_lineribbon(.width = .95) + 
+  scale_fill_brewer(palette = "Greys") +
+  labs(x = "Length of exercise program (weeks)",
+       y = "Predicted effect size (md)",
+       fill = "Credible interval") +
+  scale_y_continuous(breaks = seq(-.05, .05, .01),
+                     labels = seq(-.05, .05, .01),
+                     limits = c(-.05, .05)) +
+  scale_x_continuous(breaks = c(15, seq(5, 100, 5)),
+                     limits = c(1, 100)) +
+  plot_theme
+
+ggsave(filename = "Supplement 11. Fitting a dose-response model for intervention length.pdf",
+       plot = length_plot, width = 10, height = 6)
+length_plot
+
+length.data %>% filter(length == 26) %>% select(`.epred`) %>% summarise_draws() %>% select(mean, q5, q95) - active_control_est
+
+length.data %>% filter(length == 52) %>% select(`.epred`) %>% summarise_draws() %>% select(mean, q5, q95) - active_control_est
+```
+
+
+#### Fitting a dose-response model for interaction intervention length and age
+
+In the former visualization, we observed an inverse relationship between intervention duration and BMD outcomes; that is, the effectiveness of BMD appeared to diminish as the intervention period extended. Consequently, we intend to model the dose-response relationships between intervention length and changes in BMD, taking into account the variable of age.
+
+Examining the conditional effects of the interaction term can provide valuable insights into the interplay between these two variables. We will begin by plotting the interaction within the Exercise group, followed by an analysis of the Control group. Our observations indicate that an optimal dosage exists, which significantly varies among different age cohorts.
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
+
+model.interaction.1 <- brm(mean_diff | se(md_se) ~ 1 + 
+                             s(age_mean, k = 4) + 
+                             s(length, k = 4) +
+                             (1 | studyID), 
+                           bf(mean_diff | se(md_se) ~ age_mean * length, nl = TRUE),
+                           data = filter(d_bmd_length, trt != "Control",!is.na(age_mean)),
+                           family = gaussian(),
+                           prior = prior(normal(0, 2)), 
+                           control = list(adapt_delta = 0.99),
+                           iter = 4000, warmup = 1000)
+
+model.interaction.1.c <- brm(mean_diff | se(md_se) ~ 1 + 
+                             s(age_mean, k = 4) + 
+                             s(length, k = 4) +
+                             (1 | studyID), 
+                           bf(mean_diff | se(md_se) ~ age_mean * length, nl = TRUE),
+                           data = filter(d_bmd_length, trt == "Control",!is.na(age_mean)),
+                           family = gaussian(),
+                           prior = prior(normal(0, 2)), 
+                           control = list(adapt_delta = 0.99),
+                           iter = 4000, warmup = 1000)
+
+pdf("Supplement 12. Fitting a dose-response model for interaction intervention length and age.pdf")
+plot(conditional_effects(model.interaction.1,
+                         effects = "length:age_mean",
+                         int_conditions = list(age_mean = c(50, 60, 70, 80))),
+     line_args = c(alpha = 0.2))
+plot(conditional_effects(model.interaction.1.c,
+                         effects = "length:age_mean",
+                         int_conditions = list(age_mean = c(50, 60, 70, 80))),
+     line_args = c(alpha = 0.2))
+dev.off()
+
+```
+
+
+#### Fitting a dose-response model for weekly dose in METs
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
+
+dose_raw <- filter(d_bmd,
+                   trt != "Control" & 
+                   !is.na(weekly_dose))
+
+
+if(!exists("model_by_dose")){
+  model_by_dose <- brm(mean_diff | se(md_se) ~ 1 + s(weekly_dose, k = 4) + (1 | studyID ),
+                       data = filter(d_bmd, trt != "Control" & !is.na(weekly_dose)),
+                       control = list(adapt_delta = 0.99),
+                       cores = 8, chains = 8,
+                       iter = 6000,
+                       prior = priors, silent = 2)
+  saveRDS(model_by_dose, file = "model_by_dose.RDS")
+}
+
+dose_conditional <- conditional_effects(model_by_dose)
+dose_conditional <- clean_names(dose_conditional$weekly_dose)
+
+# Fitting a prediction model
+dose.data <- filter(d_bmd, trt != "Control" & !is.na(weekly_dose)) %>%
+  group_by(trt) %>%
+  data_grid(md_se = mean(d_bmd$md_se),
+            weekly_dose = seq(0, 1600, 50)) %>%
+  add_epred_draws(model_by_dose,
+                  ndraws = 1000,
+                  re_formula = NA)
+
+
+dose.data <- dose.data %>% filter(trt != "Control") %>%
+  group_by(trt) %>%
+  mutate(vs_uc = .epred - active_control_est)
+
+dose_raw %>% select(weekly_dose) %>% summarise(min = min(weekly_dose))
+
+# Plotting dose-response relationship between exercise dose (METs-min/week) and effect size (MD) 
+dose_plot <- ggplot(dose_conditional, aes(x = weekly_dose,
+                                          y = estimate - active_control_est,
+                                          ymin = lower - active_control_est,
+                                          ymax = upper - active_control_est)) +
+  labs(x = "Dose in MET-min / week",
+       y = "Predicted effect size vs. Control (mean)",
+       fill = "Credible interval") +
+  scale_x_continuous(breaks = c(0, seq(300, 2000, by = 300)),
+                     limits = c(0, 2000)) +
+  ylim(c(-0.02, 0.04)) +
+  plot_theme + 
+  annotate("rect", xmin = 600, xmax = 1200, ymin = -0.02, ymax = 0.04, alpha = .7, fill = "blue") +
+  annotate("text", x = 900, y = 0.035, label = "WHO Guidelines", colour = "white") +
+  geom_ribbon(alpha = 0.3) + 
+  geom_line(colour = "#0C869B")  +
+  geom_hline(yintercept = 0.02, col = "red", alpha = 0.6) +
+  annotate("text", x = 1500, y = 0.015, label = "Minimal Clinically Important Difference", colour = "red")
+
+ggsave("Figure 4. Effect predicted by weekly dose in MET-min (mcid = 0.02, WHO 600-1200).pdf", dose_plot, width = 8, height = 4)
+dose_plot
+
+```
+
+  
+# Moderate via Population Characteristics
+
+#### Age
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
+
+d_bmd$age_estimate <- d_bmd$age_mean
+
+if(!exists("moderate_by_age")){
+  moderate_by_age <- brm(mean_diff | se(md_se) ~ 1 + trt * age_estimate + (1 | studyID),
+                         data = filter(d_bmd, !is.na(age_estimate)),
+                         control = list(adapt_delta = 0.99,
+                                        max_treedepth = 15),
+                         cores = 8, chains = 8,
+                         iter = 6000,
+                         prior = priors, silent = 2)
+  saveRDS(moderate_by_age, "moderate_by_age.RDS")
+}
+summary(moderate_by_age)
+
+```
+
+
+#### Gender
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
+
+d_bmd <- d_bmd %>%
+  mutate(pc_female = as.numeric(str_remove_all(pc_female, "%")))
+
+if(!exists("moderate_by_gender")){
+  moderate_by_gender <- brm(mean_diff | se(md_se) ~ 1 + trt * pc_female + (1 | studyID),
+                            data = filter(d_bmd,!is.na(pc_female)),
+                            control = list(adapt_delta = 0.99,
+                                           max_treedepth = 15),
+                            cores = 8, chains = 8,
+                            iter = 6000,
+                            prior = priors, silent = 2)
+  saveRDS(moderate_by_gender, "moderate_by_gender.RDS")
+}
+summary(moderate_by_gender)
+
+```
+
+
+
+#### Comorbidities
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
+
+janitor::tabyl(filter(d_bmd, trt != "Control"),
+      trt, comorbid)
+#table(d$comorbid)
+if(!exists("moderate_by_comorbidities")){
+  moderate_by_comorbidities <- brm(mean_diff | se(md_se) ~ 1 + trt * comorbid + (1 | studyID),
+                                   data = filter(d_bmd,
+                                                 !is.na(comorbid)),
+                                   control = list(adapt_delta = 0.99,
+                                                  max_treedepth = 15),
+                                   cores = 8, chains = 8,
+                                   iter = 6000,
+                                   prior = priors, silent = 2)
+  saveRDS(moderate_by_comorbidities, "moderate_by_comorbidities.RDS")
+}
+
+```
+
+
+#### BMI
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
+
+d_bmd$bmi_estimate <- d_bmd$bmi_score
+
+if(!exists("moderate_by_bmi")){
+  moderate_by_bmi <- brm(mean_diff | se(md_se) ~ 1 + trt * bmi_estimate + (1 | studyID),
+                         data = filter(d_bmd, !is.na(bmi_estimate)),
+                         control = list(adapt_delta = 0.99,
+                                        max_treedepth = 15),
+                         cores = 8, chains = 8,
+                         iter = 6000,
+                         prior = priors, silent = 2)
+  saveRDS(moderate_by_bmi, "moderate_by_bmi.RDS")
+}
+
+```
+
+
+#### Vitamin D Supplement
+
+```{r, message=FALSE, warning=FALSE, error=FALSE, cache.comments=FALSE}
+
+## Which arms meet our threshold for both Not reported and Reported data:
+
+arms_with_both_reporters <- intersect(unique(filter(d_bmd,vitD_suppl == "Reported")$trt),
+                                      unique(filter(d_bmd,vitD_suppl == "Not reported")$trt))
+
+if(!exists("moderate_by_vitDsuppl")){
+  moderate_by_vitDsuppl <- brm(mean_diff | se(md_se) ~ 1 + trt*vitD_suppl + (1 | studyID),
+                           data = filter(d_bmd, trt %in% arms_with_both_reporters), 
+                         control = list(adapt_delta = 0.99),
+                         cores = 8, chains = 8,
+                         iter = 6000,
+                         prior = priors, silent = 2)
+  saveRDS(moderate_by_vitDsuppl, "moderate_by_vitDsuppl.RDS")
+}
+
+```
+
+
+#### Combine the R^2 for the moderation models
+
+Compare them to see which to explore
+
+```{r}
+
+# https://bookdown.org/ajkurz/recoding_Hayes_2018/fundamentals-of-moderation-analysis.html
+if(!exists("moderate_by_nothing")){
+  moderate_by_nothing <- brm(mean_diff | se(md_se) ~ 1 + trt + (1 | studyID),
+                             data = d_bmd,
+                             control = list(adapt_delta = 0.99,
+                                            max_treedepth = 15),
+                             cores = 8, chains = 8,
+                             iter = 6000,
+                             prior = priors, silent = 2)
+  saveRDS(moderate_by_nothing, "moderate_by_nothing.RDS")
+}
+
+# compared the R2 for the base model 
+r2_base <- 
+  bayes_R2(moderate_by_nothing,
+           summary = F) %>% 
+  data.frame()
+
+r2_gender <- 
+  bayes_R2(moderate_by_gender,
+           summary = F) %>% 
+  data.frame()
+
+r2_age <- 
+  bayes_R2(moderate_by_age,
+           summary = F) %>% 
+  data.frame()
+
+r2_comorbid <- 
+  bayes_R2(moderate_by_comorbidities,
+           summary = F) %>% 
+  data.frame()
+
+r2_vitD <- 
+  bayes_R2(moderate_by_vitDsuppl,
+           summary = F) %>% 
+  data.frame()
+
+r2_bmi <- 
+  bayes_R2(moderate_by_bmi,
+           summary = F) %>% 
+  data.frame()
+
+
+# here we combine them into one tibble, indexed by `model`
+r2 <-
+  r2_base %>% 
+  bind_rows(r2_gender) %>% 
+  bind_rows(r2_age) %>% 
+  bind_rows(r2_comorbid) %>%
+  bind_rows(r2_vitD) %>%
+  bind_rows(r2_bmi) %>%
+  mutate(model = c(rep("Base", 24000),
+                   rep("Gender", 24000),
+                   rep("Age", 24000),
+                   rep("Comorbid", 24000),
+                   rep("Vit D Supplement", 24000),
+                   rep("BMI", 24000)))
+r2 %>% group_by(model) %>%
+  summarise(mean = mean(R2),
+            sd = sd(R2)) %>%
+  arrange(mean)
+# now we plot
+r2_density <- r2 %>% 
+  ggplot(aes(x = R2)) +
+  geom_density(aes(fill = model), linewidth = 0, alpha = 2/3) +
+  scale_y_continuous(NULL, breaks = NULL) +
+  xlab(expression(paste(italic(R)^2, " distribution"))) +
+  coord_cartesian(xlim = c(0.1, 0.7)) +# plot_theme %+replace%
+  theme(legend.position = "bottom")
+
+r2_density
+ggsave("Supplement 8. Combine the R2 for the moderation models.pdf", r2_density, width = 10, height = 6)
+
+r2_base_mean <- round(mean(r2_base$R2),2)
+r2_gender_mean <- round(mean(r2_gender$R2),2)
+r2_age_mean <- round(mean(r2_age$R2),2)
+r2_comorbid_mean <- round(mean(r2_comorbid$R2),2)
+r2_vitD_mean <- round(mean(r2_vitD$R2),2)
+r2_bmi_mean <- round(mean(r2_bmi$R2),2)
+
+print(c(r2_base_mean,
+      r2_gender_mean,
+      r2_age_mean,
+      r2_comorbid_mean,
+      r2_vitD_mean,
+      r2_bmi_mean))
+
+```
+
+
+### Observing Conditional Effects of Moderators
+
+Plot the conditional effects.
+
+#### Age
+
+```{r}
+
+age_plot_data <- conditional_effects(moderate_by_age)
+age_plot <- age_plot_data$`age_estimate:trt` %>%
+  janitor::clean_names() %>%
+  mutate(estimate = estimate - active_control_est) %>%
+  rename(Age = age_estimate,
+         Modality = effect2) %>%
+  filter(!Modality %in% c("Control")) %>%
+  ggplot(aes(x = Age,
+             fill = Modality,
+             y = estimate)) +
+  geom_line(aes(colour = Modality)) + 
+  facet_wrap(Modality ~ ., ncol = 2) + 
+  geom_ribbon(aes(ymin = estimate - 1.96 * se,
+                  ymax = estimate + 1.96 * se),
+              alpha = 0.3) +
+  coord_cartesian(ylim = c(-0.03, 0.03), xlim = c(50,80)) +
+  xlab("Mean age of sample") +
+  ylab("Effect on exercise vs. control (higher is better)") + 
+  plot_theme + 
+  theme(legend.position = "none") + 
+  theme(axis.text.y = element_text(size = 5))
+
+ggsave("modality_by_age_plot.pdf", age_plot, width = 4, height = 4)
+age_plot
+
+```
+
+
+#### Gender
+
+```{r}
+
+gender_plot_data <- conditional_effects(moderate_by_gender)
+gender_plot <- gender_plot_data$`pc_female:trt` %>%
+  janitor::clean_names() %>%
+  mutate(estimate = estimate - active_control_est) %>%
+  rename(`Percent Female` = pc_female,
+         Modality = effect2) %>%
+  filter(!Modality %in% c("Control", "Brisk walking or jogging", "Whole body vibration")) %>%
+  ggplot(aes(x = `Percent Female`,
+             fill = Modality,
+             y = estimate)) +
+  geom_line(aes(colour = Modality)) + 
+  facet_wrap(Modality ~ ., ncol = 2) + 
+  geom_ribbon(aes(ymin = estimate - 1.96 * se,
+                  ymax = estimate + 1.96 * se),
+              alpha = 0.3) + 
+  coord_cartesian(ylim = c(-0.03, 0.03), xlim = c(0,100)) +
+  ylab("Effect on exercise vs. control (higher is better)") + 
+  xlab("Percent female in the study") + plot_theme + 
+  theme(axis.text.y = element_text(size = 8))
+
+ggsave("modality_by_gender_plot.pdf", gender_plot, width = 4.5, height = 5)
+gender_plot
+
+```
+
+
+#### Comorbidities
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
+
+comorbid_conditional <- conditional_effects(moderate_by_comorbidities)
+comorbid_reported_plot <- comorbid_conditional$`trt:comorbid` %>%
+  janitor::clean_names() %>%
+  mutate(estimate = estimate - active_control_est,
+         lower = lower - active_control_est,
+         upper = upper - active_control_est) %>%
+  rename(Comorbidities = effect2,
+         Modality = effect1,
+         `Effect Size`= estimate) %>%
+  filter(!(Modality %in% c("Control"))) %>%
+  ggplot(aes(x = Modality, y = `Effect Size`, ymin = lower, ymax = upper,
+             colour = Comorbidities)) +
+  geom_pointrange(position = position_dodge(width = 0.5)) +
+  coord_flip() +
+  ylab("Effect on exercise vs. control (higher is better)") +
+  scale_color_manual(values = c("Light Blue", "Dark Blue")) + 
+  theme(legend.position = "bottom")
+
+ggsave("modality_by_comorbidities.pdf", comorbid_reported_plot, width = 12, height = 6)
+comorbid_reported_plot
+
+```
+
+
+#### BMI
+
+```{r}
+
+bmi_plot_data <- conditional_effects(moderate_by_bmi)
+bmi_plot <- bmi_plot_data$`bmi_estimate:trt` %>%
+  janitor::clean_names() %>%
+  mutate(estimate = estimate - active_control_est) %>%
+  rename(Baseline_BMI = bmi_estimate,
+         Modality = effect2) %>%
+  filter(!Modality %in% c("Control")) %>%
+  ggplot(aes(x = Baseline_BMI,
+             fill = Modality,
+             y = estimate)) +
+  geom_line(aes(colour = Modality)) + 
+  facet_wrap(Modality ~ ., ncol = 2) + 
+  geom_ribbon(aes(ymin = estimate - 1.96 * se,
+                  ymax = estimate + 1.96 * se),
+              alpha = 0.3) +
+  coord_cartesian(ylim = c(-0.03, 0.03), xlim = c(18,40)) +
+  xlab("Baseline BMI of sample") +
+  ylab("Effect on exercise vs. control (higher is better)") + 
+  plot_theme + 
+  theme(legend.position = "none") + 
+  theme(axis.text.y = element_text(size = 6), axis.text.x = element_text(size = 8))
+
+ggsave("modality_by_bmi_plot.pdf", bmi_plot, width = 4, height = 4)
+bmi_plot
+
+```
+
+
+#### Vitamin D Supplement
+
+```{r, message=FALSE, warning=FALSE, error=FALSE, cache.comments=FALSE}
+
+vitDsuppl_conditional <- conditional_effects(moderate_by_vitDsuppl)
+vitDsuppl_reported_plot <- vitDsuppl_conditional$`trt:vitD_suppl` %>%
+  janitor::clean_names() %>%
+  mutate(estimate = estimate - active_control_est,
+         lower = lower - active_control_est,
+         upper = upper - active_control_est,
+         effect1 = factor(effect1, levels = unique(effect1[order(-estimate)]))) %>%
+  rename(`Vitamin D supplement` = effect2,
+         Modality = effect1,
+         `Effect Size`= estimate) %>%
+  filter(!(Modality %in% c("Control"))) %>%
+  ggplot(aes(x = Modality, y = `Effect Size`, ymin = lower, ymax = upper,
+             colour = `Vitamin D supplement`)) +
+  geom_pointrange(position = position_dodge(width = 0.5)) +
+  coord_flip(ylim = c(-0.05,0.25)) +
+  xlab("") +
+  ylab("Effect on exercise vs. control (higher is better)") +
+  scale_color_manual(values = c("Light Blue", "Dark Blue")) + 
+  theme(legend.position = "bottom")
+
+ggsave("modality_by_vitDsuppl.pdf", vitDsuppl_reported_plot, width = 8, height = 6)
+vitDsuppl_reported_plot
+
+```
+
+
+### Dose-Response Model of Moderators
+
+#### Create a network object
+
+```{r}
+
+d_bmd_mbnma <- d_bmd %>%
+  rename_at(c("trt", "weekly_dose", "mean_diff", "md_se"), ~c("agent", "dose", "y", "se")) %>%
+  group_by(studyID) %>%
+  filter(!any(is.na(dose))) %>%
+  ungroup()
+
+network <- mbnma.network(d_bmd_mbnma)
+summary(network)
+
+```
+
+
+#### Perform network meta-Analysis (NMA) and unrelated mean effects (UME) models
+
+```{r}
+
+nma_network <- MBNMAdose::mbnma.run(network, method = "random")
+ume_network <- MBNMAdose::mbnma.run(network, method = "random", UME = TRUE)
+
+```
+
+
+#### Run Emax, spline, and non-parametric models
+
+```{r}
+
+emax <- mbnma.run(network, fun = demax(emax = "rel", ed50 = "rel"), method = "random")
+ns <- mbnma.run(network, fun = dspline(type = "ns"), method = "random")
+non_param <- mbnma.run(network, fun = dnonparam(direction = "increasing"), method = "random")
+
+```
+
+
+#### Predict outcomes for "Exercise" using the spline model
+
+We could then predict how the expectations of the posterior mean responses vary across the full range of doses and differentiating by specific interventions class. We can describe a similar dose-response patterns between the different interventions class.
+
+```{r}
+
+doses <- list(
+              "Combined aerobic/resistance" = seq(0, 1600, 1),
+              "Mixed aerobic exercises" = seq(0, 1600, 1),
+              "Resistance" = seq(0, 1600, 1),
+              "Brisk walking or jogging" = seq(0, 1600, 1),
+              "Mind-body exercises" = seq(0, 1600, 1),
+              "Whole body vibration" = seq(0, 1600, 1))
+
+pred <- predict(ns, E0 = 0, exact.doses = doses, n.doses = 1600)
+
+pdf("predicting plots_class.pdf")
+plot(pred)
+dev.off()
+
+pred_summary <- summary(pred)
+
+```
+
+
+#### Examing the dose-response relationship of Moderators
+
+##### Age (40-60 vs >60 yrs)
+
+```{r}
+
+d_all <- d_bmd_mbnma %>%
+  mutate(agent = if_else(agent == "Control", "Control", "Exercise"))
+
+d_adults <- d_all %>%
+  filter(adult == "adults") %>%
+  group_by(studyID) %>%
+  filter(n() > 1) %>%
+  ungroup()
+network_adults <- mbnma.network(d_adults)
+ns_adults <- mbnma.run(network_adults, fun = dspline(type = "ns"), method = "random")
+doses_exercise <- list("Exercise" = seq(0, 1600, 1))
+pred_adults <- predict(ns_adults, E0 = 0, exact.doses = doses_exercise, n.doses = 1600)
+
+d_older_adults <- d_all %>%
+  filter(adult == "older adults") %>%
+  group_by(studyID) %>%
+  filter(n() > 1) %>%
+  ungroup()
+network_older_adults <- mbnma.network(d_older_adults)
+ns_older_adults <- mbnma.run(network_older_adults, fun = dspline(type = "ns"), method = "random")
+pred_older_adults <- predict(ns_older_adults, E0 = 0, exact.doses = doses_exercise, n.doses = 1600)
+
+pdf("predicting plots_mbnma (middle-aged adults vs aged adults).pdf", width = 8, height = 5)
+plot(pred_adults) + 
+  xlab("Physical Activity Dose (METs-min/week)") + 
+  ylab("Predicted change in BMD") +
+  scale_x_continuous(breaks = c(0, seq(300, 1600, by = 300)),
+                     limits = c(0, 1600)) +
+  scale_y_continuous(breaks = seq(-0.00, 0.10, by = 0.02),
+                     limits = c(-0.02, 0.09)) +
+  theme_minimal() +
+  ggtitle("Middle-aged adults dose-response relationship") +
+  annotate("rect", xmin = 600, xmax = 1200, ymin = -0.0, ymax = 0.09, alpha = 0.7, fill = "blue") +
+  annotate("text", x = 900, y = 0.08, label = "WHO Guidelines", angle = 0, hjust = 0.4, vjust = 0.5, colour = "white") + 
+  geom_line(colour = "#0C869B")
+plot(pred_older_adults) +
+  xlab("Physical Activity Dose (METs-min/week)") + 
+  ylab("Predicted change in BMD") +
+  scale_x_continuous(breaks = c(0, seq(300, 1600, by = 300)),
+                     limits = c(0, 1600)) +
+  scale_y_continuous(breaks = seq(-0.02, 0.04, by = 0.02),
+                     limits = c(-0.02, 0.04)) +
+  theme_minimal() +
+  ggtitle("Aged adults dose-response relationship") +
+  annotate("rect", xmin = 600, xmax = 1200, ymin = -0.02, ymax = 0.04, alpha = 0.7, fill = "blue") +
+  annotate("text", x = 900, y = 0.035, label = "WHO Guidelines", angle = 0, hjust = 0.4, vjust = 0.5, colour = "white") + 
+  geom_line(colour = "#0C869B")
+dev.off()
+
+```
+
+##### Gender (female vs male)
+
+```{r}
+
+d_female <- d_all %>% 
+  filter(pc_female == 100) %>%
+  group_by(studyID) %>%
+  filter(n() > 1) %>%
+  ungroup()
+network_female <- mbnma.network(d_female)
+ns_female <- mbnma.run(network_female, fun = dspline(type = "ns"), method = "random")
+pred_female <- predict(ns_female, E0 = 0, exact.doses = doses_exercise, n.doses = 1600)
+
+
+d_male <- d_all %>%
+  filter(pc_female == 0) %>%
+  group_by(studyID) %>%
+  filter(n() > 1) %>%
+  ungroup()
+network_male <- mbnma.network(d_male)
+ns_male <- mbnma.run(network_male, fun = dspline(type = "ns"), method = "random")
+pred_male <- predict(ns_male, E0 = 0, exact.doses = doses_exercise, n.doses = 1600)
+
+pdf("predicting plots_mbnma (female vs male).pdf", width = 8, height = 5)
+plot(pred_female) + 
+  xlab("Physical Activity Dose (METs-min/week)") + 
+  ylab("Predicted change in BMD") +
+  scale_x_continuous(breaks = c(0, seq(300, 1600, by = 300)),
+                     limits = c(0, 1600)) +
+  scale_y_continuous(breaks = seq(-0.00, 0.08, by = 0.02),
+                     limits = c(-0.02, 0.07)) +
+  theme_minimal() +
+  ggtitle("Female dose-response relationship") +
+  annotate("rect", xmin = 600, xmax = 1200, ymin = -0.00, ymax = 0.07, alpha = 0.7, fill = "blue") +
+  annotate("text", x = 900, y = 0.05, label = "WHO Guidelines", angle = 0, hjust = 0.5, vjust = 0.5, colour = "white") + 
+  geom_line(colour = "#0C869B")
+plot(pred_male) +
+  xlab("Physical Activity Dose (METs-min/week)") + 
+  ylab("Predicted change in BMD") +
+  scale_x_continuous(breaks = c(0, seq(300, 1600, by = 300)),
+                     limits = c(0, 1600)) +
+  scale_y_continuous(breaks = seq(-0.10, 0.12, by = 0.05),
+                     limits = c(-0.10, 0.12)) +
+  theme_minimal() +
+  ggtitle("Male dose-response relationship") +
+  annotate("rect", xmin = 600, xmax = 1200, ymin = -0.10, ymax = 0.12, alpha = 0.7, fill = "blue") +
+  annotate("text", x = 900, y = 0.08, label = "WHO Guidelines", angle = 0, hjust = 0.5, vjust = 0.5, colour = "white") + 
+  geom_line(colour = "#0C869B")
+dev.off()
+
+```
+
+
+##### BMI (normal weight vs overweight/obese)
+
+```{r}
+
+d_healthy <- d_all %>%
+  filter(bmi == "Healthy BMI") %>%
+  group_by(studyID) %>%
+  filter(n() > 1) %>%
+  ungroup()
+network_healthy <- mbnma.network(d_healthy)
+ns_healthy <- mbnma.run(network_healthy, fun = dspline(type = "ns"), method = "random")
+pred_healthy <- predict(ns_healthy, E0 = 0, exact.doses = doses_exercise, n.doses = 1600)
+
+
+d_overweight_obese <- d_all %>%
+  filter(bmi == "Overweight" | bmi == "Obese") %>%
+  group_by(studyID) %>%
+  filter(n() > 1) %>%
+  ungroup()
+network_overweight_obese <- mbnma.network(d_overweight_obese)
+ns_overweight_obese <- mbnma.run(network_overweight_obese, fun = dspline(type = "ns"), method = "random")
+pred_overweight_obese <- predict(ns_overweight_obese, E0 = 0, exact.doses = doses_exercise, n.doses = 1600)
+
+pdf("predicting plots_mbnma (normal weight vs overweight&obese).pdf", width = 8, height = 5)
+plot(pred_healthy) + 
+  xlab("Physical Activity Dose (METs-min/week)") + 
+  ylab("Predicted change in BMD") +
+  scale_x_continuous(breaks = c(0, seq(300, 1600, by = 300)),
+                     limits = c(0, 1600)) +
+  theme_minimal() +
+  ggtitle("Healthy BMI dose-response relationship") +
+  annotate("rect", xmin = 600, xmax = 1200, ymin = -0.0, ymax = 0.07, alpha = 0.8, fill = "blue") +
+  annotate("text", x = 900, y = 0.062, label = "WHO Guidelines", angle = 0, hjust = 0.5, vjust = 0.5, colour = "white") + 
+  geom_line(colour = "#0C869B") +
+  scale_y_continuous(breaks = seq(-0.0, 0.07, by = 0.02))
+plot(pred_overweight_obese) +
+  xlab("Physical Activity Dose (METs-min/week)") + 
+  ylab("Predicted change in BMD") +
+  scale_x_continuous(breaks = c(0, seq(300, 1600, by = 300)),
+                     limits = c(0, 1600)) +
+  theme_minimal() +
+  ggtitle("Overweight/obese dose-response relationship") +
+  annotate("rect", xmin = 600, xmax = 1200, ymin = -0.02, ymax = 0.04, alpha = 0.7, fill = "blue") +
+  annotate("text", x = 900, y = 0.035, label = "WHO Guidelines", angle = 0, hjust = 0.5, vjust = 0.5, colour = "white") + 
+  geom_line(colour = "#0C869B")
+dev.off()
+
+```
+
+
+### MCID and optimal dose (METs-min/ week)
+
+```{r}
+
+val_1pct <- mcid$MCID_1pct[mcid$outcome == "Lumbar BMD"] #Femoral BMD, Hip total BMD
+val_2pct <- mcid$MCID_2pct[mcid$outcome == "Lumbar BMD"] #Femoral BMD, Hip total BMD
+
+extract_doses <- function(df, subgroup_name, category_name) {
+  
+    opt_dose <- df %>%
+    arrange(desc(mean)) %>%
+    slice(1) %>%
+    pull(dose) %>%
+    round(0) 
+  
+  get_mcid_string <- function(threshold) {
+    valid_data <- df %>% filter(mean > threshold)
+    
+    if(nrow(valid_data) == 0) return("na.")
+    
+    doses <- valid_data %>%
+      mutate(abs_diff = abs(mean - threshold)) %>%
+      arrange(abs_diff) %>%
+      slice(1:2) %>%
+      arrange(dose) %>%
+      pull(dose) %>%
+      round(0) 
+    
+    if(length(doses) == 1) {
+      return(as.character(doses[1]))
+    } else {
+      gap <- doses[2] - doses[1]
+      
+      if(gap <= 50) { 
+        return(as.character(doses[1]))
+      } else {
+        return(paste0(doses[1], "~", doses[2]))
+      }
+    }
+  }
+  
+  tibble(
+    Category = category_name,
+    Subgroup = subgroup_name,
+    `1% MCID` = get_mcid_string(val_1pct),
+    `2% MCID` = get_mcid_string(val_2pct),
+    Optimal = as.character(opt_dose)
+  )
+}
+
+# --- I: All ---
+df_all <- dose_conditional %>% 
+  transmute(dose = weekly_dose, mean = estimate - active_control_est)
+res_all <- extract_doses(df_all, "All", "Overall")
+
+# --- II: Types of physical activity ---
+agents <- unique(pred_summary$agent)
+agents <- setdiff(agents, c("Placebo", "placebo", "PLACEBO"))
+
+res_agents_list <- lapply(agents, function(agt) {
+  df_agt <- pred_summary %>% filter(agent == agt)
+  extract_doses(df_agt, agt, "Types of physical activity")
+})
+res_agents <- bind_rows(res_agents_list)
+
+# --- III: Gender, Age, BMI ---
+predictions_list <- list(
+  Adults = pred_adults, 
+  Older_Adults = pred_older_adults, 
+  Female = pred_female, 
+  Male = pred_male, 
+  Healthy = pred_healthy, 
+  Overweight_Obese = pred_overweight_obese
+)
+
+summaries_list <- lapply(predictions_list, summary)
+
+res_gender <- bind_rows(
+  extract_doses(summaries_list$Male, "Male", "Gender"),
+  extract_doses(summaries_list$Female, "Female", "Gender")
+)
+
+res_age <- bind_rows(
+  extract_doses(summaries_list$Adults, "Middle-aged adults (40-60 yrs)", "Age"),
+  extract_doses(summaries_list$Older_Adults, "Aged adults (60-80 yrs)", "Age")
+)
+
+res_bmi <- bind_rows(
+  extract_doses(summaries_list$Healthy, "Healthy BMI (18-25 kg/m2)", "BMI"),
+  extract_doses(summaries_list$Overweight_Obese, "Overweight/obese (>25 kg/m2)", "BMI")
+)
+
+final_data <- bind_rows(res_all, res_agents, res_gender, res_age, res_bmi)
+
+final_table_gt <- final_data %>%
+  gt(rowname_col = "Subgroup", groupname_col = "Category") %>%
+  
+  tab_spanner(
+    label = "Lumbar spine BMD", # Femoral BMD, Hip total BMD
+    columns = c(`1% MCID`, `2% MCID`, Optimal)
+  ) %>%
+  
+  row_group_order(groups = c("Overall", "Types of physical activity", "Gender", "Age", "BMI")) %>%
+  
+  tab_options(
+    row_group.font.weight = "bold",       
+    column_labels.font.weight = "bold",   
+    table.border.top.color = "black",
+    table.border.bottom.color = "black",
+    heading.title.font.size = 14
+  ) %>%
+  
+  tab_stubhead(label = "Subgroup by exercise type, gender, age and BMI") %>%
+  
+  cols_align(
+    align = "center",
+    columns = c(`1% MCID`, `2% MCID`, Optimal)
+  ) %>%
+  
+  tab_header(
+    title = md("**Minimal effective and optimal doses to improve BMD**")
+  )
+
+gtsave(final_table_gt, "Table 2 Minimal effective and optimal doses to improve BMD.docx")
+
+final_table_gt %>%
+  gtsave("Table 2 Minimal effective and optimal doses to improve BMD.html")
+
+```
+
+# Converting Effect Sizes into Marginal Effects for Comparison Against Control
+
+In our previous analyses, we demonstrated that the accumulated dose is a crucial factor to consider when implementing a physical activity program. However, what role does the **type** of activity play? Subsequently, we can forecast how the anticipated posterior mean responses fluctuate across the entire spectrum of doses, while also distinguishing between specific interventions.
+
+```{r}
+
+library(janitor)
+
+conditional_effs <- conditional_effects(model_by_treatment)
+
+vs_active_control <- conditional_effs$trt %>% clean_names() %>%
+  select(trt, estimate, lower, upper) %>%
+  rename(conf.high = upper,
+         conf.low = lower)
+
+# add n and k
+arm_n_k <- d_bmd %>%
+  distinct(studyID, trt, .keep_all = TRUE) %>%
+  group_by(trt) %>%
+  summarise(n = sum(n),
+            k = n())
+
+vs_active_control <- left_join(vs_active_control, arm_n_k, by = "trt")
+
+full_ranks <- netrank(full_pairwise_model, small.values = "bad", method = "SUCRA", nsim = 10000)
+full_ranks <- as.data.frame(full_ranks$ranking.random)
+full_ranks$trt <- rownames(full_ranks)
+full_ranks <- rename(full_ranks,
+                     sucra = `full_ranks$ranking.random`)
+
+vs_active_control <- left_join(vs_active_control, full_ranks, by = "trt")
+
+new_levs <- unique(vs_active_control$trt[order(-vs_active_control$estimate)])
+
+
+vs_active_control %>% filter(trt == "Control")
+
+vs_active_control <- vs_active_control %>%
+    mutate(conf.low = conf.low - estimate[trt == "Control"],
+         conf.high = conf.high - estimate[trt == "Control"],
+         estimate = estimate - estimate[trt == "Control"]) %>%
+  filter(trt != "Control")
+
+# Add N
+# Add k
+# Add exact CI
+vs_active_control$gci <- paste(format(round(vs_active_control$estimate,3), nsmall = 2),
+      " [", format(round(vs_active_control$conf.low,3), nsmall = 2),
+      ", ", format(round(vs_active_control$conf.high,3), nsmall = 2),"]",
+      sep = "")
+
+library(ggtext)
+
+vs_active_control_plot <- vs_active_control %>%
+  mutate(trt = factor(trt, levels = new_levs)) %>%
+  ggplot(aes(x = trt,
+             y = estimate,
+             ymin = conf.low,
+             ymax = conf.high)) +
+  geom_pointrange(aes(colour = sucra)) +
+  scale_color_continuous("blues") +
+  geom_hline(yintercept = 0.02, col = "#8172B2", alpha = 2, linetype = "dashed") +
+  geom_hline(yintercept = -0.02, col = "darkgrey", alpha = 0.4) +
+  geom_richtext(x = 8, y = 0.03, label = "Minimal Clinically Important Difference", fontface = "italic",
+                label.size = NA, colour = "#8172B2", hjust = 1 ) +
+  xlab("") +
+  ylab("Effect compared with control (MD)") +
+  coord_flip(xlim = c(1,16), clip = "off") + plot_theme %+replace%
+  theme(plot.margin = margin(5,250,5,5)) +
+  geom_text(x = vs_active_control$trt, y = 0.033, label = vs_active_control$gci) +
+  geom_text(x = length(vs_active_control$trt)+1, y = 0.033, label = "MD [95% CI]") +
+  geom_text(x = vs_active_control$trt, y = 0.047, hjust = 1,
+            label = format(vs_active_control$n, big.mark = ",")) +
+  geom_text(x = length(vs_active_control$trt)+1, y = 0.046, hjust = 1, label = "n") +
+  geom_text(x = vs_active_control$trt, y = 0.05, label = vs_active_control$k) +
+  geom_text(x = length(vs_active_control$trt)+1, y = 0.05, label = "k")
+
+ggsave("Figure 3. Converting Effect Sizes into Marginal Effects for Comparison Against Control.pdf",
+       vs_active_control_plot,
+       dpi = "retina",
+       width = 10, height = 4)
+
+write.csv(vs_active_control, "vs_active_control_table.csv", row.names = FALSE)
+
+```
+
+
+### Table of Study/Participant Characteristics x Treatment Arm
+
+```{r}
+
+study_by_arm <- d_bmd %>% 
+  group_by(trt) %>%
+  select(n, country, comorbid, vitD_suppl, pc_female, length, pre_mean,
+         trt, age_mean, studyID, bmi_score, bmi, weekly_dose) %>%
+  distinct(studyID, trt, weekly_dose, .keep_all = TRUE) %>%
+  group_by(trt) %>%
+  mutate(pc_female = as.numeric(str_remove_all(pc_female, "%")),
+         bmi = case_when(bmi == "Healthy BMI" ~ "Healthy", TRUE ~ bmi)) %>%
+  summarise(k = n(),
+            Total_N = sum(n, na.rm = TRUE), 
+            
+            duration_mean = round(mean(length, na.rm = TRUE),2),
+            duration_sd = round(sd(length, na.rm = TRUE),2),
+            age_sd = round(sd(age_mean, na.rm = TRUE), 2),
+            age_mean = round(mean(age_mean, na.rm = TRUE), 2),
+            female_mean = round(mean(pc_female, na.rm = TRUE), 2),
+            female_sd = round(sd(pc_female, na.rm = TRUE), 2),
+            prebmd_mean = round(mean(pre_mean, na.rm = TRUE), 2),
+            prebmd_sd = round(sd(pre_mean, na.rm = TRUE), 2),
+            bmi_mean = round(mean(bmi_score, na.rm = TRUE), 1),
+            bmi_sd = round(sd(bmi_score, na.rm = TRUE), 2),
+            weekly_dose_mean = round(mean(weekly_dose, na.rm = TRUE), 0),
+            weekly_dose_sd = round(sd(weekly_dose, na.rm = TRUE), 2),
+            
+            n_comorbid = sum(ifelse(comorbid == "Reported", n, 0), na.rm = TRUE),
+            n_vitD_suppl = sum(ifelse(vitD_suppl == "Reported", n, 0), na.rm = TRUE),
+            n_Healthy = sum(ifelse(bmi == "Healthy", n, 0), na.rm = TRUE),
+            n_Overweight = sum(ifelse(bmi == "Overweight", n, 0), na.rm = TRUE),
+            n_Obese = sum(ifelse(bmi == "Obese", n, 0), na.rm = TRUE),
+            
+            Countries = paste(sort(unique(country)), collapse = ", ")) %>%
+  mutate(Countries = gsub(" Not reported,", "", Countries),
+         `Age (years)` = ifelse(is.na(age_mean),
+                                NA,
+                                paste0(age_mean, " (", age_sd, ")")),
+         `Percent Female` = ifelse(is.na(female_mean),
+                                   NA,
+                                   paste0(female_mean, " (", female_sd, ")")),
+         `Duration (weeks)` = ifelse(is.na(duration_mean) | trt %in% c("Control"),
+                                     NA,
+                                     paste0(duration_mean, " (", duration_sd, ")")),
+         `BMI (kg/㎡)` = ifelse(is.na(bmi_mean),
+                               NA,
+                               paste0(bmi_mean, " (", bmi_sd, ")")),
+         `Dose (METs−min/week)` = ifelse(is.na(weekly_dose_mean),
+                                         NA,
+                                         paste0(weekly_dose_mean, " (", weekly_dose_sd, ")")),
+         `Baseline BMD (g/cm²)` = ifelse(is.na(prebmd_mean),
+                                         NA,
+                                         paste0(prebmd_mean, " (", prebmd_sd, ")")),
+         
+         pc_comorbid = sprintf("%.0f%% (%d)", (n_comorbid / Total_N) * 100, n_comorbid),
+         pc_vitD_suppl = sprintf("%.0f%% (%d)", (n_vitD_suppl / Total_N) * 100, n_vitD_suppl),
+         pc_Healthy = sprintf("%.0f%% (%d)", (n_Healthy / Total_N) * 100, n_Healthy),
+         pc_Overweight = sprintf("%.0f%% (%d)", (n_Overweight / Total_N) * 100, n_Overweight),
+         pc_Obese = sprintf("%.0f%% (%d)", (n_Obese / Total_N) * 100, n_Obese),
+         
+         n = format(Total_N, big.mark = ",")
+  ) %>%
+  select(-age_mean, -age_sd, 
+         -female_mean, -female_sd, -duration_mean, -duration_sd,
+         -bmi_mean, -bmi_sd, -weekly_dose_mean, -weekly_dose_sd, -prebmd_mean, -prebmd_sd,
+         -Total_N, -n_comorbid, -n_vitD_suppl, -n_Healthy, -n_Overweight, -n_Obese) %>%
+  relocate(n, .after = k) %>% 
+  rename("Exercise" = trt,
+         "Comorbidities" = pc_comorbid,
+         "Vitamin D supplement" = pc_vitD_suppl,
+         "Normal Weight" = pc_Healthy,
+         "Overweight" = pc_Overweight,
+         "Obese" = pc_Obese
+  ) %>%
+  apa("Study and Participant Characteristics by Treatment Arm") |> 
+  tab_spanner(
+    label = "Participants with, % (n)", 
+    columns = c(
+      "Comorbidities",
+      "Vitamin D supplement",
+      "Normal Weight",
+      "Overweight",
+      "Obese"
+    )
+  ) |>
+  tab_spanner(
+    label = "Mean (SD)",
+    columns = c("Age (years)", "Percent Female", "BMI (kg/㎡)", "Baseline BMD (g/cm²)", "Dose (METs−min/week)", "Duration (weeks)")
+  )
+
+study_by_arm %>% gtsave("Supplement 6. Summary Table of Global Parameters for Each Exercise Arm.html")
+study_by_arm %>% gtsave("Supplement 6. Summary Table of Global Parameters for Each Exercise Arm.docx")
+study_by_arm |>
+  tab_options(
+    ihtml.active = TRUE,
+    ihtml.use_filters = TRUE,
+    ihtml.use_compact_mode = TRUE,
+    ihtml.use_pagination = FALSE,
+  ) %>% gtsave("Supplement 6. Study by Treatment Arm Interactive.html")
+
+```
+  
+
+# Chapter 4: Exercise for Fracture Analysis
+
+#### Creating Pairwise Data
+
+```{r}
+
+d_fracture <- d %>%
+  filter(outcome == "Fracture") %>%
+  mutate(response = as.numeric(response)) %>%
+  mutate(response = if_else(is.na(response) | response == 0, 0.005, response))
+
+one_effect_per_arm_fracture <- d_fracture %>% 
+  mutate(rob = as.numeric(factor(overall, levels = c("Low", "Some concern", "High")))) %>%
+  select(studyID, trt, response, n, rob, indirectness) %>%
+  write.csv(.,
+          "one_effect_per_arm_fracture.csv")
+
+acceptibility_pairwise <- pairwise(treat = trt,
+                                   n = n,
+                                   event = response,
+                                   reference.group = "Control",
+                                   studlab = studyID,
+                                   data = d_fracture,
+                                   sm = "OR")
+
+full_pairwise_acceptibility <- netmeta(acceptibility_pairwise,
+                                       common = FALSE,
+                                       details.chkmultiarm = TRUE,
+                                       reference.group = "Control")
+
+pdf(file = "fracture/forest plot of pairwise of fracture.pdf", width = 10, height = 4)
+plot(full_pairwise_acceptibility,
+     sortvar = names(sort(netrank(full_pairwise_acceptibility)[[1]])),
+     reference.group = "Control")
+dev.off()
+
+```
+
+
+#### Network plot
+
+```{r}
+
+n_per_trt_fracture <- d_fracture %>% group_by(trt) %>%
+  summarise(n = sum(n))
+
+pts_size_fracture <- table(c(full_pairwise_acceptibility$treat1, full_pairwise_acceptibility$treat2))
+pts_size_fracture <- as.data.frame(pts_size_fracture) %>% rename(trt = Var1)
+pts_size_fracture <- left_join(pts_size_fracture, n_per_trt_fracture)
+
+pdf(file = "fracture/Figure 2. Network_plot of fracture.pdf", width = 8, height = 5)
+netmeta::netgraph(full_pairwise_acceptibility,
+                  points = TRUE,
+                  cex.points = pts_size_fracture$n,
+                  plastic = FALSE,
+                  lwd = 2,
+                  offset = .04,
+                  col = "darkgrey",
+                  col.points = "#00B2BE",
+                  number.of.studies = TRUE,
+                  labels = paste0(trts, " (n=", n.trts, ")"),
+                  alpha.transparency = .3)
+dev.off()
+
+```
+
+
+#### Network analysis
+
+```{r}
+
+netmeta_accept <- netmetabin(acceptibility_pairwise)
+
+acceptibility_n_k <- d_fracture %>%
+  ungroup() %>%
+  distinct(studyID, trt, .keep_all = TRUE) %>%
+  group_by(trt) %>%
+  summarise(n = sum(n),
+            Fractures = sum(response),
+            k = n())
+rownames(acceptibility_n_k) <- acceptibility_n_k$trt
+
+pdf(file = "fracture/Supplement 15. Forest Plot of Fracture Analysis.pdf", width = 10, height = 4)
+forest(netmeta_accept,
+       sortvar = names(sort(netrank(netmeta_accept)[[1]])),
+       reference.group = "Control",
+       drop.reference.group = TRUE,
+       leftcols = c("studlab","k", "n"),
+       smlab = "Comparison vs Control\n(Mantel-Haenszel Method)")
+dev.off()
+
+```
+
+Finished. 
