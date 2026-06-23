@@ -3,24 +3,30 @@ title: 'Exercise for BMD analysis'
 output: html_document
 date: "2025-02"
 
-For a better understanding of the dataset, we will going to explain the data extracted from the original studies included in this systematic review.
-- studyID indicates the name of the study. Each row corresponds to each study-arm.
-- n refers to the total sample size of the the specific study-arm.
-- age_mean represents the average age of the adults included in the specific study-arm.
-- country  indicates the region/continent where the study was carried out.
-- pc_female refers to the percentage of females within the specific study-arm.
-- bmi_score indicates the average Body Mass Index of the sample at baseline.  
-- comorbid refers to the presence of orthopedic-related co-morbidities within the study sample.
-- vitD_suppl refers to the supplementation of Vitamin D .
-These variables were characteristics that help us to qualitatively describe the sample of our included studies. The following variables correspond with descriptive statistics.
-- trt is the type of physical activity performed in a specific study-arm.
-- mean_diff is the mean change in BMD from baseline for a specific study-arm.
-- mean_diff_sd is the standard deviation of the mean change from baseline.
-- sessionsrefers to the frequency of intervention in terms of sessions per week.
-- session_duration is the average session time of minutes per day.
-- daily_dose corresponds to the METs-min/day (i.e., daily dose of physical activity) of each study-arm.
-- weekly_dose corresponds to the daily dose multiplied by the intervention frequency, yielding the weekly dose of physical activity (i.e., METs-min/week).
-- response corresponds to the number of fractures in a specific study-arm.
+
+To facilitate a better understanding of the dataset, the variables extracted from the original studies included in this systematic review are outlined below:
+- studyID: The identifier for the study (each row in the dataset represents a specific study-arm).
+- pren: The sample size of the specific study-arm at baseline.
+- n: The final sample size of the specific study-arm at the post-intervention time point.
+- outcome: The specific outcome of interest measured (e.g., Lumbar BMD, Femoral BMD, Hip total BMD, or Fracture).
+- age_mean: The mean age (in years) of the participants in the specific study-arm.
+- length: The duration of the intervention, expressed in weeks.
+- country: The country or geographical region where the study was conducted.
+- pc_female: The percentage of female participants within the specific study-arm.
+- bmi_score: The mean baseline Body Mass Index (BMI, kg/m²) of the study sample.
+- comorbid: Indicates the presence of orthopedic-related comorbidities within the study sample.
+- vitD_suppl: Indicates whether participants received Vitamin D supplementation.
+The variables above describe the baseline demographics and characteristics of the included studies. The following variables relate to the intervention parameters and outcome statistics:
+- trt: The type of physical activity intervention assigned to a specific study-arm.
+- mean_diff: The mean change in Bone Mineral Density (BMD) from baseline to post-intervention.
+- mean_diff_sd: The standard deviation (SD) of the mean change in BMD.
+- pre_mean: The mean baseline BMD value.
+- pre_sd: The standard deviation of the baseline BMD.
+- sessions: The intervention frequency, measured in sessions per week.
+- session_duration: The average duration of each exercise session, in minutes.
+- daily_dose: The daily dose of physical activity for the study-arm, expressed in MET-minutes/day.
+- weekly_dose: The weekly dose of physical activity, expressed in MET-minutes/week (calculated by multiplying the daily dose by the weekly frequency).
+- response: The total number of fracture events recorded in a specific study-arm.
 
 ---
 
@@ -74,7 +80,7 @@ d <- read_csv("bmd data.csv") %>%
   mutate(across(c(n, mean_diff_sd, mean_diff, length, pre_mean, pre_sd, bmi_score), as.numeric),
          md_se = ifelse(is.na(mean_diff_sd) | is.na(n), NA, mean_diff_sd/sqrt(n)))
 
-# Load our dataset from bayesian analyses, Read the analyses that we don't want to re-run
+# Load the Bayesian analysis dataset and retrieve cached results to save computational time.
 
 # model_by_treatment <- readRDS("model_by_treatment.RDS")
 # model_by_dose <- readRDS("model_by_dose.RDS")
@@ -84,7 +90,6 @@ d <- read_csv("bmd data.csv") %>%
 # moderate_by_gender <- readRDS("moderate_by_gender.RDS")
 # moderate_by_age <- readRDS("moderate_by_age.RDS")
 # moderate_by_comorbidities <- readRDS("moderate_by_comorbidities.RDS")
-# moderate_by_bmd <- readRDS("moderate_by_bmd.RDS")
 # moderate_by_bmi <- readRDS("moderate_by_bmi.RDS")
 # moderate_by_vitDsuppl <- readRDS("moderate_by_vitDsuppl.RDS")
 
@@ -212,6 +217,17 @@ cis_table <- d %>%
          length, weekly_dose,
          comorbid, vitD_suppl, outcome) %>%
   arrange(tolower(studyID_ROB), length, pc_female, desc(trt)) %>%
+  
+  mutate(
+    outcome = case_when(
+      outcome == "Lumbar BMD" ~ "①",
+      outcome == "Femoral BMD" ~ "②",
+      outcome == "Hip total BMD" ~ "③",
+      outcome == "Fracture" ~ "④",
+      TRUE ~ outcome 
+    )
+  ) %>%
+  
   group_by(studyID_ROB, trt) %>% 
   mutate(n = max(n, na.rm = T),
          pc_female = as.integer(round(as.numeric(str_remove_all(pc_female, "%")), 0)),
@@ -219,7 +235,7 @@ cis_table <- d %>%
          weekly_dose = ifelse(is.na(weekly_dose), NA, round(weekly_dose, 0)),
          comorbid = ifelse(comorbid == "Reported", "Y", "N"),
          vitD_suppl = ifelse(vitD_suppl == "Reported","Y","N"),
-         outcome = paste0(unique(outcome), collapse = ", "),
+         outcome = paste0(sort(unique(outcome)), collapse = ""),
          length = paste0(unique(length), collapse = ", ")) %>%
   distinct() %>% 
   group_by(studyID_ROB) %>%
@@ -235,6 +251,7 @@ cis_table <- d %>%
          "Length (weeks)" = length,
          "Exercise dose (METs-min/week)" = weekly_dose,
          "Outcomes measured" = outcome)
+
 cis_table %>%
   apa("Supplement 4. Characteristics of Included Studies") %>%
   gtsave("Characteristics of Included Studies Table.html")
@@ -271,10 +288,6 @@ names(rob_judgments) <- gsub("_mode", "", names(rob_judgments))
 rob_table <- rob_judgments %>%
   arrange(tolower(studyID_ROB)) %>%
   distinct() %>% 
-  mutate(across(D1:overall,
-                gsub,
-                pattern = " risk",
-                replacement = "")) %>%
   select(studyID_ROB,
          D1,
          D2,
@@ -298,6 +311,8 @@ rob_table %>% gtsave("Risk of Bias in Individual Studies.docx")
 
 # Chapter 3: Exercise for Lumbar/Femoral/Hip BMD Analysis
 
+⚠️NOTE: The analytic code is designed to evaluate one specific outcome at a time. The default outcome in the code below is set to "Lumbar BMD". To analyze other outcomes, manually replace "Lumbar BMD" with "Femoral BMD" or "Hip total BMD" in the line below: lines 325, 698, 1537-1538 and 1631.
+
 Guided by Harrer (2021), we are going to fit a Bayesian meta-analysis model using the formula `response | se(se_response) ~ 1 + predictors + (1 | grouping variable)`, where our response variable is the mean difference in BMD, predicted by the weekly energy expenditure (METs-min/week), the length of intervention, and the population characteristics, and maintaining the clusterisation of the effect sizes within studies (`studyID` as grouping variable).
 
 ### Creating Pairwise Data and CINeMA Data
@@ -307,9 +322,7 @@ First, we are going to filter our data by the outcome of interest (i.e., `Lumbar
 ```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
 
 d_bmd <- d %>% 
-  filter(outcome == "Lumbar BMD") %>%
-#  filter(outcome == "Femoral BMD") %>%
-#  filter(outcome == "Hip total BMD") %>%
+  filter(outcome == "Lumbar BMD") %>% #Femoral BMD, Hip total BMD
   mutate(length = as.numeric(length)) %>% 
   group_by(studyID) %>% 
   filter(length == max(length, na.rm = TRUE)) %>% 
@@ -682,9 +695,7 @@ dev.off()
 ```{r, message=FALSE, error=FALSE, warning=FALSE, results='hide', echo = FALSE}
 
 d_bmd_length <- d %>% 
-  filter(outcome == "Lumbar BMD")
-#  filter(outcome == "Femoral BMD")
-#  filter(outcome == "Hip total BMD")
+  filter(outcome == "Lumbar BMD") #Femoral BMD, Hip total BMD
   
 pdf("Supplement 8. Visualization of length-response trend.pdf")
 d_bmd_length %>% filter(trt != "Control") %>%
@@ -1278,6 +1289,62 @@ non_param <- mbnma.run(network, fun = dnonparam(direction = "increasing"), metho
 ```
 
 
+#### Convergence Diagnostics of MCMC Chains
+
+```{r}
+
+library(bayesplot)
+library(ggplot2)
+
+my_model <- ns  
+
+bugs_out <- if(!is.null(my_model$jagsresult$BUGSoutput)) {
+  my_model$jagsresult$BUGSoutput
+} else {
+  my_model$BUGSoutput
+}
+
+rhat_values <- bugs_out$summary[, "Rhat"]
+rhat_values <- rhat_values[!is.na(rhat_values)]
+
+pdf("Appendix3_Rhat_Diagnostic.pdf", width = 8, height = 5)
+print(
+  mcmc_rhat(rhat_values) +
+    geom_vline(xintercept = 1.05, linetype = "dashed", color = "red") +
+    theme_minimal() +
+    ggtitle("Gelman-Rubin Diagnostic (R-hat)", 
+            subtitle = "Values < 1.05 indicate successful convergence")
+)
+dev.off()
+
+mcmc_array <- bugs_out$sims.array
+
+all_pars <- dimnames(mcmc_array)[[3]]
+plot_pars <- all_pars[grepl("^d\\[|^beta|^sd", all_pars)]
+
+pdf("Appendix3_Density_Plots.pdf", width = 12, height = 8)
+print(
+  mcmc_dens_overlay(mcmc_array, pars = plot_pars) + 
+    theme_minimal() +
+    theme(strip.text = element_text(size = 12, face = "bold")) +
+    ggtitle("Posterior Density Plots for Main Dose-Response Parameters",
+            subtitle = "Perfectly overlapping curves indicate good chain mixing and convergence")
+)
+dev.off()
+
+pdf("Appendix3_Trace_Plots.pdf", width = 12, height = 8)
+print(
+  mcmc_trace(mcmc_array, pars = plot_pars, facet_args = list(ncol = 2)) + 
+    theme_minimal() +
+    theme(strip.text = element_text(size = 12, face = "bold")) +
+    ggtitle("Trace Plots for Main Dose-Response Parameters",
+            subtitle = "'Hairy caterpillar' appearance indicates successful convergence")
+)
+dev.off()
+
+```
+
+
 #### Predict outcomes for "Exercise" using the spline model
 
 We could then predict how the expectations of the posterior mean responses vary across the full range of doses and differentiating by specific interventions class. We can describe a similar dose-response patterns between the different interventions class.
@@ -1561,7 +1628,7 @@ final_table_gt <- final_data %>%
   gt(rowname_col = "Subgroup", groupname_col = "Category") %>%
   
   tab_spanner(
-    label = "Lumbar spine BMD", # Femoral BMD, Hip total BMD
+    label = "Lumbar spine BMD", #Femoral BMD, Hip total BMD
     columns = c(`1% MCID`, `2% MCID`, Optimal)
   ) %>%
   
@@ -1785,6 +1852,8 @@ study_by_arm |>
   
 
 # Chapter 4: Exercise for Fracture Analysis
+
+⚠️Note: The following fracture analysis uses a binary outcome and is evaluated independently of BMD outcomes above.
 
 #### Creating Pairwise Data
 
